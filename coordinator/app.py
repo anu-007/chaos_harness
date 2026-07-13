@@ -17,6 +17,7 @@ import redis.asyncio as aioredis
 from aiohttp import web
 
 from db import Database, DBPartitioned
+from ws import WorkerRegistry, handle_ws
 
 # Redis pub/sub channel the dispatch loop listens on for immediate wakeups.
 WAKEUP_CHANNEL = "jobs:wakeup"
@@ -198,6 +199,8 @@ def make_app() -> web.Application:
     app["coord_id"] = os.environ.get("COORD_ID", "c?")
     app["lease_ttl_ms"] = int(os.environ.get("LEASE_TTL_MS", "10000"))
     app["start_monotonic"] = time.monotonic()
+    # Per-process registry of workers connected to THIS coordinator.
+    app["workers"] = WorkerRegistry()
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     app.add_routes(
@@ -205,6 +208,7 @@ def make_app() -> web.Application:
             web.get("/stats", handle_stats),
             web.post("/jobs", handle_create_job),
             web.get("/jobs/{job_id}", handle_get_job),
+            web.get("/ws", handle_ws),
         ]
     )
     return app
