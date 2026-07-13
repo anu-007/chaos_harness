@@ -19,6 +19,10 @@ _DEFAULT_SCHEMA = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "db", "schema.sql"
 )
 
+# Fixed key for the advisory lock that serializes concurrent schema application across
+# coordinators booting simultaneously.
+_SCHEMA_LOCK_KEY = 0x5C4E_3A11
+
 
 class DBPartitioned(Exception):
     """Raised while the partition_db chaos fault has gated this coordinator's DB."""
@@ -56,8 +60,15 @@ class Database:
         path = schema_path or os.environ.get("SCHEMA_PATH", _DEFAULT_SCHEMA)
         with open(path) as f:
             sql = f.read()
+        # All coordinators boot at once and race to apply the same DDL. Even with
+        # IF NOT EXISTS, concurrent CREATE EXTENSION/INDEX can collide (the existence
+        # check and the create are not atomic across sessions). Serialize schema apply
+        # behind a transaction-scoped advisory lock: one coordinator applies while the
+        # others block, then their idempotent IF NOT EXISTS clauses all no-op.
         async with self._pool.acquire() as conn:
-            await conn.execute(sql)
+            async with conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock($1)", _SCHEMA_LOCK_KEY)
+                await conn.execute(sql)
 
     # --- partition_db fault control -------------------------------------------------
 
