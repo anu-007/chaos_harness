@@ -33,7 +33,13 @@ class Database:
 
     @classmethod
     def from_env(cls) -> "Database":
-        dsn = os.environ["DATABASE_URL"]
+        dsn = os.environ.get("DATABASE_URL")
+        if not dsn:
+            raise RuntimeError(
+                "DATABASE_URL is not set. Point it at Postgres, e.g. "
+                "'postgres://postgres:postgres@localhost:5432/farlabs'. "
+                "The docker-compose stack (make up) sets this automatically."
+            )
         return cls(dsn)
 
     async def connect(self, *, min_size: int = 2, max_size: int = 10) -> None:
