@@ -24,6 +24,26 @@ WAKEUP_CHANNEL = "jobs:wakeup"
 MAX_IDEMPOTENCY_KEY_LEN = 128
 
 
+async def record_transition(conn, job_id, from_state, to_state, coordinator) -> None:
+    """Append one row to the job_transitions log, stamped with DB-clock time.
+
+    Central helper reused everywhere a job changes state so every transition is recorded
+    consistently (DB time, not coordinator time) and the /audit + no-lost checks hold.
+    Must run inside a caller-provided transaction/connection so it commits atomically with
+    the state change that triggered it.
+    """
+    await conn.execute(
+        """
+        INSERT INTO job_transitions (job_id, from_state, to_state, at_ms, coordinator)
+        VALUES ($1, $2, $3, db_now_ms(), $4)
+        """,
+        job_id,
+        from_state,
+        to_state,
+        coordinator,
+    )
+
+
 def format_uptime(seconds: float) -> str:
     total = int(seconds)
     h, rem = divmod(total, 3600)
@@ -89,16 +109,10 @@ async def handle_create_job(request: web.Request) -> web.Response:
             created = row is not None
             if created:
                 job_id = row["job_id"]
-                # First transition (none)->pending, stamped with DB-clock time, in the
-                # same transaction so the job and its history commit atomically.
-                await conn.execute(
-                    """
-                    INSERT INTO job_transitions
-                        (job_id, from_state, to_state, at_ms, coordinator)
-                    VALUES ($1, NULL, 'pending', db_now_ms(), $2)
-                    """,
-                    job_id,
-                    app["coord_id"],
+                # First transition (none)->pending, in the same transaction so the job
+                # and its history commit atomically.
+                await record_transition(
+                    conn, job_id, None, "pending", app["coord_id"]
                 )
             else:
                 job_id = await conn.fetchval(
@@ -120,6 +134,34 @@ async def handle_create_job(request: web.Request) -> web.Response:
 
     return web.json_response(
         {"job_id": str(job_id)}, status=201 if created else 200
+    )
+
+
+async def handle_get_job(request: web.Request) -> web.Response:
+    app = request.app
+    db: Database = app["db"]
+    job_id = request.match_info["job_id"]
+
+    try:
+        row = await db.fetchrow(
+            "SELECT job_id, state, result FROM jobs WHERE job_id = $1::uuid",
+            job_id,
+        )
+    except DBPartitioned:
+        return web.json_response(
+            {"error": "database partitioned; retry later"}, status=503
+        )
+    except Exception:  # noqa: BLE001 - e.g. malformed uuid
+        return web.json_response({"error": "invalid job_id"}, status=400)
+
+    if row is None:
+        return web.json_response({"error": "job not found"}, status=404)
+
+    result = row["result"]
+    if isinstance(result, str):
+        result = json.loads(result)
+    return web.json_response(
+        {"job_id": str(row["job_id"]), "state": row["state"], "result": result}
     )
 
 
@@ -162,6 +204,7 @@ def make_app() -> web.Application:
         [
             web.get("/stats", handle_stats),
             web.post("/jobs", handle_create_job),
+            web.get("/jobs/{job_id}", handle_get_job),
         ]
     )
     return app
