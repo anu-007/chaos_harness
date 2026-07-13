@@ -28,8 +28,9 @@ class Dispatcher:
         self.coord_id = app["coord_id"]
         self.db = app["db"]
         self.registry = app["workers"]
-        # Callback(conn, job_id, payload, worker_state) -> awaitable, run inside the claim
-        # transaction to issue the lease + push dispatch. Defaults to transition-only.
+        # Callback(conn, job_id, worker_state) -> awaitable[int fence], run inside the claim
+        # transaction to insert the fenced lease row + record the transition. The WS push
+        # happens in _claim_one after commit. Overridable for tests.
         self._lease_issuer = lease_issuer or self._default_issue
         self._wake = asyncio.Event()
         self._task: asyncio.Task | None = None
@@ -105,8 +106,15 @@ class Dispatcher:
                     break
 
     async def _claim_one(self, state) -> bool:
-        """Atomically claim one pending job for `state` and issue its lease. Returns True
-        if a job was claimed, False if none were available."""
+        """Atomically claim one pending job for `state`, issue its fenced lease, then push
+        the dispatch to the worker. Returns True if a job was claimed, False if none were
+        available.
+
+        Claim + lease-row INSERT + transition all commit in ONE transaction, so a SIGKILLed
+        coordinator leaves a job either fully-pending or fully-leased, never orphaned
+        mid-claim. The WS push happens only AFTER that transaction commits, so a worker can
+        never receive a dispatch for a lease that later rolled back.
+        """
         async with self.db.transaction() as conn:
             row = await conn.fetchrow(
                 """
@@ -124,18 +132,61 @@ class Dispatcher:
             if row is None:
                 return False
             job_id = row["job_id"]
-            await self._lease_issuer(conn, job_id, row["payload"], state)
-            logging.info(
-                "coordinator %s: claimed job %s for worker %s",
-                self.coord_id,
-                job_id,
-                state.worker_id,
+            payload = row["payload"]
+            fence = await self._lease_issuer(conn, job_id, state)
+
+        # Committed. Reserve capacity and push the dispatch to the worker. If the send
+        # fails the worker is gone; drop the reservation and let the reaper re-lease.
+        state.inflight.add(job_id)
+        try:
+            await state.ws.send_json(
+                {
+                    "type": "dispatch",
+                    "job_id": str(job_id),
+                    "payload": payload,
+                    "fence": fence,
+                }
             )
+        except Exception as e:  # noqa: BLE001 - worker vanished after commit
+            state.inflight.discard(job_id)
+            logging.warning(
+                "coordinator %s: dispatch push to worker %s failed for job %s "
+                "(lease %d will be reaped): %s",
+                self.coord_id,
+                state.worker_id,
+                job_id,
+                fence,
+                e,
+            )
+            return True
+        logging.info(
+            "coordinator %s: leased job %s to worker %s (fence=%d)",
+            self.coord_id,
+            job_id,
+            state.worker_id,
+            fence,
+        )
         return True
 
-    async def _default_issue(self, conn, job_id, payload, state) -> None:
-        """Step 10 default: record the pending->leased transition. Replaced in Step 11
-        with fence issuance + WS dispatch push."""
+    async def _default_issue(self, conn, job_id, state) -> int:
+        """Issue the fenced lease for a just-claimed job, inside the claim transaction.
+
+        Inserts the lease row (fence from nextval('fence_seq'), issued/expiry stamped from
+        the DB clock via db_now_ms) and records the pending->leased transition. Returns the
+        allocated fence token so the caller can push it to the worker after commit.
+        """
         from app import record_transition
 
+        ttl_ms = self.app["lease_ttl_ms"]
+        fence = await conn.fetchval(
+            """
+            INSERT INTO leases (job_id, fence, worker, issued_at_ms, expires_at_ms)
+            VALUES ($1, nextval('fence_seq'), $2, db_now_ms(), db_now_ms() + $3)
+            RETURNING fence
+            """,
+            job_id,
+            state.worker_id,
+            ttl_ms,
+        )
         await record_transition(conn, job_id, "pending", "leased", self.coord_id)
+        return fence
