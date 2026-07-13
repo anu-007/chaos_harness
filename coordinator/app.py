@@ -8,6 +8,7 @@ on startup, applies the schema idempotently, and serves a plain-text /stats endp
 Dispatch, leases, commits, audit, and the other endpoints are added in later steps.
 """
 
+import json
 import logging
 import os
 import time
@@ -15,7 +16,12 @@ import time
 import redis.asyncio as aioredis
 from aiohttp import web
 
-from db import Database
+from db import Database, DBPartitioned
+
+# Redis pub/sub channel the dispatch loop listens on for immediate wakeups.
+WAKEUP_CHANNEL = "jobs:wakeup"
+# Cap idempotency keys so a client can't stuff arbitrarily large values.
+MAX_IDEMPOTENCY_KEY_LEN = 128
 
 
 def format_uptime(seconds: float) -> str:
@@ -36,6 +42,85 @@ async def handle_stats(request: web.Request) -> web.Response:
         f"coordinator: {app['coord_id']}  uptime: {format_uptime(uptime)}  leader_term: n/a",
     ]
     return web.Response(text="\n".join(lines) + "\n", content_type="text/plain")
+
+
+async def handle_create_job(request: web.Request) -> web.Response:
+    app = request.app
+    db: Database = app["db"]
+
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - malformed body
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+
+    idempotency_key = body.get("idempotency_key")
+    if not isinstance(idempotency_key, str) or not idempotency_key:
+        return web.json_response(
+            {"error": "idempotency_key is required and must be a non-empty string"},
+            status=400,
+        )
+    if len(idempotency_key.encode("utf-8")) > MAX_IDEMPOTENCY_KEY_LEN:
+        return web.json_response(
+            {"error": f"idempotency_key exceeds {MAX_IDEMPOTENCY_KEY_LEN} bytes"},
+            status=400,
+        )
+
+    payload = body.get("payload", {})
+    if not isinstance(payload, dict):
+        return web.json_response(
+            {"error": "payload must be a JSON object"}, status=400
+        )
+    payload_json = json.dumps(payload)
+
+    try:
+        async with db.transaction() as conn:
+            # Dedup insert. RETURNING gives job_id only when a new row is created; a
+            # same-key resubmit (even concurrently on another coordinator) conflicts.
+            row = await conn.fetchrow(
+                """
+                INSERT INTO jobs (idempotency_key, payload)
+                VALUES ($1, $2::jsonb)
+                ON CONFLICT (idempotency_key) DO NOTHING
+                RETURNING job_id
+                """,
+                idempotency_key,
+                payload_json,
+            )
+            created = row is not None
+            if created:
+                job_id = row["job_id"]
+                # First transition (none)->pending, stamped with DB-clock time, in the
+                # same transaction so the job and its history commit atomically.
+                await conn.execute(
+                    """
+                    INSERT INTO job_transitions
+                        (job_id, from_state, to_state, at_ms, coordinator)
+                    VALUES ($1, NULL, 'pending', db_now_ms(), $2)
+                    """,
+                    job_id,
+                    app["coord_id"],
+                )
+            else:
+                job_id = await conn.fetchval(
+                    "SELECT job_id FROM jobs WHERE idempotency_key = $1",
+                    idempotency_key,
+                )
+    except DBPartitioned:
+        return web.json_response(
+            {"error": "database partitioned; retry later"}, status=503
+        )
+
+    # Wake the dispatch loop only for genuinely new work. Redis is best-effort: if it
+    # is down the periodic dispatch poll still picks the job up.
+    if created:
+        try:
+            await app["redis"].publish(WAKEUP_CHANNEL, str(job_id))
+        except Exception as e:  # noqa: BLE001 - Redis is best-effort
+            logging.warning("redis wakeup publish failed (continuing): %s", e)
+
+    return web.json_response(
+        {"job_id": str(job_id)}, status=201 if created else 200
+    )
 
 
 async def on_startup(app: web.Application) -> None:
@@ -73,7 +158,12 @@ def make_app() -> web.Application:
     app["start_monotonic"] = time.monotonic()
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
-    app.add_routes([web.get("/stats", handle_stats)])
+    app.add_routes(
+        [
+            web.get("/stats", handle_stats),
+            web.post("/jobs", handle_create_job),
+        ]
+    )
     return app
 
 
