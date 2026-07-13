@@ -17,6 +17,7 @@ import redis.asyncio as aioredis
 from aiohttp import web
 
 from db import Database, DBPartitioned
+from dispatch import Dispatcher
 from ws import WorkerRegistry, handle_ws
 
 # Redis pub/sub channel the dispatch loop listens on for immediate wakeups.
@@ -125,9 +126,11 @@ async def handle_create_job(request: web.Request) -> web.Response:
             {"error": "database partitioned; retry later"}, status=503
         )
 
-    # Wake the dispatch loop only for genuinely new work. Redis is best-effort: if it
-    # is down the periodic dispatch poll still picks the job up.
+    # Wake the dispatch loop only for genuinely new work. Wake this coordinator's loop
+    # directly (immediate) and publish to Redis so peers wake too; Redis is best-effort,
+    # if it is down the periodic dispatch poll still picks the job up.
     if created:
+        app["dispatcher"].wake()
         try:
             await app["redis"].publish(WAKEUP_CHANNEL, str(job_id))
         except Exception as e:  # noqa: BLE001 - Redis is best-effort
@@ -182,10 +185,18 @@ async def on_startup(app: web.Application) -> None:
     except Exception as e:  # noqa: BLE001 - Redis is best-effort
         logging.warning("redis ping failed at startup (continuing): %s", e)
 
+    # Start the dispatch loop now that DB, Redis, and the worker registry are ready.
+    dispatcher = Dispatcher(app)
+    dispatcher.start()
+    app["dispatcher"] = dispatcher
+
     logging.info("coordinator %s started", app["coord_id"])
 
 
 async def on_cleanup(app: web.Application) -> None:
+    dispatcher = app.get("dispatcher")
+    if dispatcher is not None:
+        await dispatcher.stop()
     db = app.get("db")
     if db is not None:
         await db.close()
