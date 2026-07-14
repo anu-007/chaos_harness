@@ -14,7 +14,7 @@ import logging
 
 from aiohttp import web, WSMsgType
 
-from commit import handle_commit
+from commit import handle_commit, handle_heartbeat
 from db import DBPartitioned
 
 
@@ -125,12 +125,16 @@ async def _route(app: web.Application, state: ConnState, data: dict) -> None:
                 state.worker_id,
             )
     elif mtype == "heartbeat":
-        # Placeholder until Step 14 adds lease renewal.
-        logging.debug(
-            "coordinator %s: heartbeat from %s (not yet handled)",
-            app["coord_id"],
-            state.worker_id,
-        )
+        try:
+            await handle_heartbeat(app, state, data)
+        except DBPartitioned:
+            # Fail-closed: skip the renewal while partitioned. The reaper's TTL still
+            # bounds correctness; the worker will heartbeat again shortly.
+            logging.debug(
+                "coordinator %s: heartbeat from %s dropped (db partitioned)",
+                app["coord_id"],
+                state.worker_id,
+            )
     else:
         logging.warning(
             "coordinator %s: unknown WS message type %r from %s",

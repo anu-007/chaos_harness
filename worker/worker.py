@@ -3,11 +3,12 @@
 Dials the coordinator cluster outbound over a single persistent WebSocket through the
 nginx LB (ws://lb:8080/ws) and registers itself: connect, register, read loop, and
 reconnect with exponential backoff on any drop. On a `dispatch` it runs the job (a bounded
-sleep) under a local concurrency semaphore and sends back `commit{job_id,fence,result}`.
-Heartbeat renewal and commit-retry are added in later steps.
+sleep) under a local concurrency semaphore, sends `heartbeat{job_id,fence}` every ~3s while
+it runs so the coordinator can renew the lease, and finally sends
+`commit{job_id,fence,result}`. Commit-retry is added in a later step.
 
-All timing here uses a MONOTONIC clock (backoff intervals only) — never wall-clock — so a
-clock_skew fault cannot affect reconnect behaviour.
+All timing here uses a MONOTONIC clock (backoff + heartbeat intervals) — never wall-clock —
+so a clock_skew fault cannot affect reconnect or heartbeat cadence.
 """
 
 import asyncio
@@ -21,6 +22,9 @@ import aiohttp
 # Backoff bounds for outbound reconnect (seconds).
 _BACKOFF_MIN = 0.5
 _BACKOFF_MAX = 10.0
+# How often a running job pings its lease. Must be well under LEASE_TTL_MS (10s) so a lease
+# is renewed several times before it could expire.
+_HEARTBEAT_INTERVAL_S = 3.0
 
 
 class Worker:
@@ -131,7 +135,7 @@ class Worker:
         sleep_ms = max(0, min(int(payload.get("sleep_ms", 0)), 60000))
         async with self._slots:
             try:
-                await asyncio.sleep(sleep_ms / 1000.0)
+                await self._run_with_heartbeats(ws, job_id, fence, sleep_ms / 1000.0)
             except asyncio.CancelledError:
                 # Disconnected mid-job; drop it (no commit) and let the reaper re-lease.
                 raise
@@ -159,6 +163,35 @@ class Worker:
                     fence,
                     e,
                 )
+
+    async def _run_with_heartbeats(self, ws, job_id, fence, duration_s: float) -> None:
+        """Sleep `duration_s` while emitting heartbeat{job_id,fence} every ~3s so the
+        coordinator keeps renewing the lease. All timing is monotonic (loop.time), so a
+        clock_skew fault can't shorten or stretch the interval. A heartbeat send failure is
+        non-fatal: the socket is likely dying and the read loop will tear the job down.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + duration_s
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(_HEARTBEAT_INTERVAL_S, remaining))
+            if loop.time() >= deadline:
+                return
+            try:
+                await ws.send_json(
+                    {"type": "heartbeat", "job_id": job_id, "fence": fence}
+                )
+            except Exception as e:  # noqa: BLE001 - socket dying; let read loop tear down
+                logging.warning(
+                    "worker %s heartbeat send failed for job %s (fence=%s): %s",
+                    self.worker_id,
+                    job_id,
+                    fence,
+                    e,
+                )
+                return
 
     async def _cancel_jobs(self) -> None:
         if not self._jobs:

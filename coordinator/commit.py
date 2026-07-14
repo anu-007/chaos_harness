@@ -20,6 +20,41 @@ import json
 import logging
 
 
+async def handle_heartbeat(app, state, data: dict) -> None:
+    """Renew a live lease on a worker heartbeat, extending its deadline by the TTL.
+
+    Only the CURRENT lease (matching job_id AND fence) that is still live (expired_at_ms
+    IS NULL) is renewed — a stale worker whose lease was already reaped/re-leased cannot
+    resurrect it. The new deadline is db_now_ms()+TTL (DB clock), so clock_skew on the
+    worker or this coordinator can't affect expiry. Fail-closed: a DBPartitioned propagates
+    to the WS route and is swallowed; the reaper's TTL still bounds correctness.
+    """
+    db = app["db"]
+    job_id = data.get("job_id")
+    fence = data.get("fence")
+    if job_id is None or not isinstance(fence, int):
+        return
+    ttl_ms = app["lease_ttl_ms"]
+    status = await db.execute(
+        """
+        UPDATE leases SET expires_at_ms = db_now_ms() + $3
+        WHERE job_id = $1::uuid AND fence = $2 AND expired_at_ms IS NULL
+        """,
+        job_id,
+        fence,
+        ttl_ms,
+    )
+    # status is like "UPDATE 1" / "UPDATE 0"; 0 means the lease was already expired/reaped.
+    if status.endswith(" 0"):
+        logging.debug(
+            "coordinator %s: stale heartbeat job %s fence=%s from %s (no live lease)",
+            app["coord_id"],
+            job_id,
+            fence,
+            state.worker_id,
+        )
+
+
 async def handle_commit(app, state, data: dict) -> None:
     db = app["db"]
     coord_id = app["coord_id"]
