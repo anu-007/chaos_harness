@@ -62,12 +62,18 @@ def format_uptime(seconds: float) -> str:
 
 async def handle_stats(request: web.Request) -> web.Response:
     app = request.app
+    # True uptime is monotonic (immune to clock_skew). The clock_skew fault shifts ONLY this
+    # displayed value + logs, never any timestamp used for correctness (fence/lease/commit
+    # times all come from db_now_ms()). Clamp at 0 so a large negative skew can't show a
+    # nonsensical negative uptime.
     uptime = time.monotonic() - app["start_monotonic"]
+    skew_s = app.get("logical_clock_offset_s", 0)
+    display_uptime = max(0.0, uptime + skew_s)
     reaper = app.get("reaper")
     max_release_ms = reaper.max_rels_latency_ms if reaper is not None else 0
     lines = [
-        f"coordinator: {app['coord_id']}  uptime: {format_uptime(uptime)}  leader_term: n/a",
-        f"workers: {len(app['workers'])}  max_release_latency_ms: {max_release_ms}",
+        f"coordinator: {app['coord_id']}  uptime: {format_uptime(display_uptime)}  leader_term: n/a",
+        f"workers: {len(app['workers'])}  max_release_latency_ms: {max_release_ms}  clock_skew_s: {skew_s}",
     ]
     return web.Response(text="\n".join(lines) + "\n", content_type="text/plain")
 
@@ -317,6 +323,9 @@ def make_app() -> web.Application:
     app["start_monotonic"] = time.monotonic()
     # drop_acks fault counter: acks to suppress before resuming normal replies (Step 17).
     app["drop_acks_remaining"] = 0
+    # clock_skew fault offset (seconds): affects ONLY /stats uptime display + logs, never any
+    # correctness timestamp (those come from db_now_ms()). See chaos.py (Step 18).
+    app["logical_clock_offset_s"] = 0
     # Per-process registry of workers connected to THIS coordinator.
     app["workers"] = WorkerRegistry()
     app.on_startup.append(on_startup)
