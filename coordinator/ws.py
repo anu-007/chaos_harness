@@ -14,6 +14,9 @@ import logging
 
 from aiohttp import web, WSMsgType
 
+from commit import handle_commit
+from db import DBPartitioned
+
 
 class ConnState:
     """One connected worker's live state on this coordinator."""
@@ -108,14 +111,24 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
 
 
 async def _route(app: web.Application, state: ConnState, data: dict) -> None:
-    """Dispatch an inbound worker message. heartbeat/commit handlers land in later steps."""
+    """Dispatch an inbound worker message. heartbeat handling lands in Step 14."""
     mtype = data.get("type")
-    if mtype in ("heartbeat", "commit"):
-        # Placeholder until Steps 13-14 add lease renewal + fenced commit handling.
+    if mtype == "commit":
+        try:
+            await handle_commit(app, state, data)
+        except DBPartitioned:
+            # Fail-closed: the DB is partitioned by chaos. Send no ack so the worker
+            # retries the commit once the partition clears; the job stays leased.
+            logging.warning(
+                "coordinator %s: commit from %s dropped (db partitioned); worker will retry",
+                app["coord_id"],
+                state.worker_id,
+            )
+    elif mtype == "heartbeat":
+        # Placeholder until Step 14 adds lease renewal.
         logging.debug(
-            "coordinator %s: %s from %s (not yet handled)",
+            "coordinator %s: heartbeat from %s (not yet handled)",
             app["coord_id"],
-            mtype,
             state.worker_id,
         )
     else:

@@ -137,18 +137,21 @@ class Dispatcher:
 
         # Committed. Reserve capacity and push the dispatch to the worker. If the send
         # fails the worker is gone; drop the reservation and let the reaper re-lease.
-        state.inflight.add(job_id)
+        # inflight is keyed by the string job_id so the commit handler (which sees the id
+        # as a string over JSON) can discard the same key.
+        job_id_str = str(job_id)
+        state.inflight.add(job_id_str)
         try:
             await state.ws.send_json(
                 {
                     "type": "dispatch",
-                    "job_id": str(job_id),
+                    "job_id": job_id_str,
                     "payload": payload,
                     "fence": fence,
                 }
             )
         except Exception as e:  # noqa: BLE001 - worker vanished after commit
-            state.inflight.discard(job_id)
+            state.inflight.discard(job_id_str)
             logging.warning(
                 "coordinator %s: dispatch push to worker %s failed for job %s "
                 "(lease %d will be reaped): %s",
