@@ -9,6 +9,7 @@ Dispatch, leases, commits, audit, and the other endpoints are added in later ste
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -186,6 +187,161 @@ async def handle_get_job(request: web.Request) -> web.Response:
     )
 
 
+# Terminal states — a job here will never transition again, so the stream can close.
+TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled"})
+# SSE stream safety cap: never hold a connection open longer than this even if the job
+# somehow never terminates. Well above any bounded job (payload sleep clamps at 60s).
+STREAM_MAX_SECONDS = 120.0
+# How often the stream polls the durable transition log for new rows.
+STREAM_POLL_S = 0.5
+
+
+async def handle_cancel_job(request: web.Request) -> web.Response:
+    """POST /jobs/{id}/cancel — cancel a job that has not started yet.
+
+    Only a `pending` job can be cancelled: it isn't leased to any worker, so cancelling is a
+    pure state change with no worker-side coordination. A `leased` (or terminal) job returns
+    409 — we never yank work already running under a live fenced lease, which would risk a
+    worker committing a result for a job we called cancelled.
+
+    The transition is a single conditional UPDATE (WHERE state='pending') committed
+    atomically with its job_transitions row, so concurrent cancels/dispatches on different
+    coordinators can't both win: at most one flips pending->cancelled.
+    """
+    app = request.app
+    db: Database = app["db"]
+    coord_id = app["coord_id"]
+    job_id = request.match_info["job_id"]
+
+    try:
+        async with db.transaction() as conn:
+            updated = await conn.fetchval(
+                """
+                UPDATE jobs SET state='cancelled', updated_at=now()
+                WHERE job_id = $1::uuid AND state='pending'
+                RETURNING job_id
+                """,
+                job_id,
+            )
+            if updated is not None:
+                await record_transition(conn, job_id, "pending", "cancelled", coord_id)
+    except DBPartitioned:
+        return web.json_response(
+            {"error": "database partitioned; retry later"}, status=503
+        )
+    except Exception:  # noqa: BLE001 - e.g. malformed uuid
+        return web.json_response({"error": "invalid job_id"}, status=400)
+
+    if updated is not None:
+        return web.json_response({"job_id": job_id, "state": "cancelled"})
+
+    # Nothing updated: either the job doesn't exist (404) or it isn't pending (409).
+    try:
+        cur = await db.fetchval(
+            "SELECT state FROM jobs WHERE job_id = $1::uuid", job_id
+        )
+    except DBPartitioned:
+        return web.json_response(
+            {"error": "database partitioned; retry later"}, status=503
+        )
+    except Exception:  # noqa: BLE001 - e.g. malformed uuid
+        return web.json_response({"error": "invalid job_id"}, status=400)
+
+    if cur is None:
+        return web.json_response({"error": "job not found"}, status=404)
+    return web.json_response(
+        {"error": f"job not cancellable in state '{cur}'", "state": cur}, status=409
+    )
+
+
+async def handle_stream_job(request: web.Request) -> web.Response:
+    """GET /jobs/{id}/stream — Server-Sent Events of a job's state changes until terminal.
+
+    Reads the durable job_transitions log (never in-memory state) so the stream is correct
+    regardless of which coordinator is driving the job — the client may be pinned to a
+    different coordinator than the one issuing leases/commits. Emits each new transition as
+    an SSE `state` event, then a final `done` event when the job reaches a terminal state,
+    and closes. Fails closed with 503 if the DB is partitioned before the stream opens.
+    """
+    app = request.app
+    db: Database = app["db"]
+    job_id = request.match_info["job_id"]
+
+    # Confirm the job exists (and the id parses) before opening the SSE stream, so a bad id
+    # gets a normal 404/400 rather than a half-open event stream.
+    try:
+        current = await db.fetchval(
+            "SELECT state FROM jobs WHERE job_id = $1::uuid", job_id
+        )
+    except DBPartitioned:
+        return web.json_response(
+            {"error": "database partitioned; retry later"}, status=503
+        )
+    except Exception:  # noqa: BLE001 - e.g. malformed uuid
+        return web.json_response({"error": "invalid job_id"}, status=400)
+    if current is None:
+        return web.json_response({"error": "job not found"}, status=404)
+
+    resp = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+    await resp.prepare(request)
+
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + STREAM_MAX_SECONDS
+    last_id = 0
+    terminal_seen = False
+    try:
+        while loop.time() < deadline:
+            try:
+                rows = await db.fetch(
+                    """
+                    SELECT id, from_state, to_state, at_ms, coordinator
+                    FROM job_transitions
+                    WHERE job_id = $1::uuid AND id > $2
+                    ORDER BY id
+                    """,
+                    job_id,
+                    last_id,
+                )
+            except DBPartitioned:
+                # Transient: the driving coordinator's DB may be fine; just retry after the
+                # poll interval rather than tearing down a stream that's mid-job.
+                await asyncio.sleep(STREAM_POLL_S)
+                continue
+
+            for r in rows:
+                last_id = r["id"]
+                payload = json.dumps(
+                    {
+                        "from": r["from_state"],
+                        "to": r["to_state"],
+                        "at_ms": r["at_ms"],
+                        "coordinator": r["coordinator"],
+                    }
+                )
+                await resp.write(f"event: state\ndata: {payload}\n\n".encode())
+                if r["to_state"] in TERMINAL_STATES:
+                    terminal_seen = True
+
+            if terminal_seen:
+                await resp.write(b"event: done\ndata: {}\n\n")
+                break
+            await asyncio.sleep(STREAM_POLL_S)
+    except (ConnectionResetError, asyncio.CancelledError):
+        # Client went away; stop quietly.
+        pass
+    finally:
+        with contextlib.suppress(Exception):
+            await resp.write_eof()
+    return resp
+
+
 async def handle_audit(request: web.Request) -> web.Response:
     """Return the full audit trail for one job: its transition log, commit-attempt log, and
     lease history. This is the harness's window into correctness — it reads the three
@@ -348,6 +504,8 @@ def make_app() -> web.Application:
             web.get("/stats", handle_stats),
             web.post("/jobs", handle_create_job),
             web.get("/jobs/{job_id}", handle_get_job),
+            web.post("/jobs/{job_id}/cancel", handle_cancel_job),
+            web.get("/jobs/{job_id}/stream", handle_stream_job),
             web.get("/audit", handle_audit),
             web.post("/chaos", handle_chaos),
             web.post("/workers/{id}/concurrency", handle_set_concurrency),
