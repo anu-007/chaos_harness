@@ -133,6 +133,9 @@ async def handle_commit(app, state, data: dict) -> None:
             from app import record_transition
 
             await record_transition(conn, job_id, "leased", "succeeded", coord_id)
+            # Genuine first accept (not a replay/re-ack) — count it toward the completed
+            # rate. Best-effort; incr() swallows Redis errors and falls back to memory.
+            await app["rates"].incr("completed")
             await _finish(app, state, conn, job_id, fence, True, replay=False)
         else:
             # Stale or expired fence: record the rejected attempt for /audit and tell the
@@ -146,6 +149,9 @@ async def handle_commit(app, state, data: dict) -> None:
                 fence,
                 state.worker_id,
             )
+            # A rejected (stale/expired-fence) commit attempt — surface it as a failed
+            # commit in the rate line. The job itself isn't lost: the reaper re-leases it.
+            await app["rates"].incr("failed")
             await _finish(app, state, conn, job_id, fence, False, replay=False)
 
 
