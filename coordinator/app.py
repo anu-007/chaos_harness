@@ -18,6 +18,7 @@ from aiohttp import web
 
 from db import Database, DBPartitioned
 from dispatch import Dispatcher
+from reaper import Reaper
 from ws import WorkerRegistry, handle_ws
 
 # Redis pub/sub channel the dispatch loop listens on for immediate wakeups.
@@ -60,8 +61,11 @@ def format_uptime(seconds: float) -> str:
 async def handle_stats(request: web.Request) -> web.Response:
     app = request.app
     uptime = time.monotonic() - app["start_monotonic"]
+    reaper = app.get("reaper")
+    max_release_ms = reaper.max_rels_latency_ms if reaper is not None else 0
     lines = [
         f"coordinator: {app['coord_id']}  uptime: {format_uptime(uptime)}  leader_term: n/a",
+        f"workers: {len(app['workers'])}  max_release_latency_ms: {max_release_ms}",
     ]
     return web.Response(text="\n".join(lines) + "\n", content_type="text/plain")
 
@@ -190,10 +194,18 @@ async def on_startup(app: web.Application) -> None:
     dispatcher.start()
     app["dispatcher"] = dispatcher
 
+    # Start the reaper (needs dispatcher wired so it can wake dispatch after requeueing).
+    reaper = Reaper(app)
+    reaper.start()
+    app["reaper"] = reaper
+
     logging.info("coordinator %s started", app["coord_id"])
 
 
 async def on_cleanup(app: web.Application) -> None:
+    reaper = app.get("reaper")
+    if reaper is not None:
+        await reaper.stop()
     dispatcher = app.get("dispatcher")
     if dispatcher is not None:
         await dispatcher.stop()

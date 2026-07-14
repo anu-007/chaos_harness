@@ -165,13 +165,18 @@ class Worker:
                 )
 
     async def _run_with_heartbeats(self, ws, job_id, fence, duration_s: float) -> None:
-        """Sleep `duration_s` while emitting heartbeat{job_id,fence} every ~3s so the
-        coordinator keeps renewing the lease. All timing is monotonic (loop.time), so a
-        clock_skew fault can't shorten or stretch the interval. A heartbeat send failure is
-        non-fatal: the socket is likely dying and the read loop will tear the job down.
+        """Sleep `duration_s` while emitting heartbeat{job_id,fence} so the coordinator
+        keeps renewing the lease. Sends one heartbeat IMMEDIATELY (before the first sleep)
+        so a just-issued lease — possibly delayed behind the concurrency semaphore — is
+        confirmed alive at once and can't lapse before the first renewal, then every ~3s
+        after. All timing is monotonic (loop.time), so a clock_skew fault can't shorten or
+        stretch the interval. A heartbeat send failure is non-fatal: the socket is likely
+        dying and the read loop will tear the job down.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + duration_s
+        if not await self._heartbeat(ws, job_id, fence):
+            return
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -179,19 +184,25 @@ class Worker:
             await asyncio.sleep(min(_HEARTBEAT_INTERVAL_S, remaining))
             if loop.time() >= deadline:
                 return
-            try:
-                await ws.send_json(
-                    {"type": "heartbeat", "job_id": job_id, "fence": fence}
-                )
-            except Exception as e:  # noqa: BLE001 - socket dying; let read loop tear down
-                logging.warning(
-                    "worker %s heartbeat send failed for job %s (fence=%s): %s",
-                    self.worker_id,
-                    job_id,
-                    fence,
-                    e,
-                )
+            if not await self._heartbeat(ws, job_id, fence):
                 return
+
+    async def _heartbeat(self, ws, job_id, fence) -> bool:
+        """Send one heartbeat. Returns False if the socket is dying so the caller stops."""
+        try:
+            await ws.send_json(
+                {"type": "heartbeat", "job_id": job_id, "fence": fence}
+            )
+            return True
+        except Exception as e:  # noqa: BLE001 - socket dying; let read loop tear down
+            logging.warning(
+                "worker %s heartbeat send failed for job %s (fence=%s): %s",
+                self.worker_id,
+                job_id,
+                fence,
+                e,
+            )
+            return False
 
     async def _cancel_jobs(self) -> None:
         if not self._jobs:
