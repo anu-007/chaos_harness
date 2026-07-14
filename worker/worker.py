@@ -1,10 +1,10 @@
 """Worker process.
 
 Dials the coordinator cluster outbound over a single persistent WebSocket through the
-nginx LB (ws://lb:8080/ws) and registers itself. This step establishes the connection
-lifecycle only: connect, register, read loop, and reconnect with exponential backoff on
-any drop. The job executor, heartbeat renewal, and commit/commit-retry are added in later
-steps; inbound messages are logged for now.
+nginx LB (ws://lb:8080/ws) and registers itself: connect, register, read loop, and
+reconnect with exponential backoff on any drop. On a `dispatch` it runs the job (a bounded
+sleep) under a local concurrency semaphore and sends back `commit{job_id,fence,result}`.
+Heartbeat renewal and commit-retry are added in later steps.
 
 All timing here uses a MONOTONIC clock (backoff intervals only) — never wall-clock — so a
 clock_skew fault cannot affect reconnect behaviour.
@@ -29,6 +29,10 @@ class Worker:
         self.concurrency = concurrency
         # ws://lb:8080 -> ws://lb:8080/ws
         self.ws_url = lb_url.rstrip("/") + "/ws"
+        # Local slot limiter so this worker never runs more than `concurrency` jobs at once.
+        self._slots = asyncio.Semaphore(concurrency)
+        # In-flight executor tasks, so a disconnect can cancel them cleanly.
+        self._jobs: set[asyncio.Task] = set()
 
     async def run(self) -> None:
         """Connect/register/read forever, reconnecting with exponential backoff."""
@@ -71,7 +75,13 @@ class Worker:
                 self.worker_id,
                 self.concurrency,
             )
-            await self._read_loop(ws)
+            try:
+                await self._read_loop(ws)
+            finally:
+                # Connection ended: cancel any jobs still running against this socket so
+                # they don't try to commit over a dead WS. The coordinator's reaper will
+                # re-lease anything left leased.
+                await self._cancel_jobs()
         logging.info("worker %s disconnected", self.worker_id)
 
     async def _read_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
@@ -84,7 +94,7 @@ class Worker:
                         "worker %s got non-JSON frame: %r", self.worker_id, msg.data
                     )
                     continue
-                await self._handle(data)
+                await self._handle(ws, data)
             elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING):
                 break
             elif msg.type == aiohttp.WSMsgType.ERROR:
@@ -93,9 +103,70 @@ class Worker:
                 )
                 break
 
-    async def _handle(self, data: dict) -> None:
-        # Executor / heartbeat / commit handling arrive in later steps. Log for now.
-        logging.info("worker %s received: %s", self.worker_id, data.get("type"))
+    async def _handle(self, ws: aiohttp.ClientWebSocketResponse, data: dict) -> None:
+        mtype = data.get("type")
+        if mtype == "dispatch":
+            # Run the job in the background so the read loop keeps servicing the socket
+            # (heartbeats, further dispatches). The semaphore bounds real concurrency.
+            task = asyncio.create_task(self._execute(ws, data))
+            self._jobs.add(task)
+            task.add_done_callback(self._jobs.discard)
+        else:
+            logging.info("worker %s received: %s", self.worker_id, mtype)
+
+    async def _execute(self, ws: aiohttp.ClientWebSocketResponse, data: dict) -> None:
+        job_id = data.get("job_id")
+        fence = data.get("fence")
+        payload = data.get("payload") or {}
+        # The coordinator relays payload straight from Postgres jsonb, which asyncpg hands
+        # back as a JSON string; decode it here so either shape works.
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        # Bounded sleep models the work; clamp so a bad payload can't stall a slot forever.
+        sleep_ms = max(0, min(int(payload.get("sleep_ms", 0)), 60000))
+        async with self._slots:
+            try:
+                await asyncio.sleep(sleep_ms / 1000.0)
+            except asyncio.CancelledError:
+                # Disconnected mid-job; drop it (no commit) and let the reaper re-lease.
+                raise
+            result = {"ok": True, "worker": self.worker_id, "slept_ms": sleep_ms}
+            try:
+                await ws.send_json(
+                    {
+                        "type": "commit",
+                        "job_id": job_id,
+                        "fence": fence,
+                        "result": result,
+                    }
+                )
+                logging.info(
+                    "worker %s committed job %s (fence=%s)",
+                    self.worker_id,
+                    job_id,
+                    fence,
+                )
+            except Exception as e:  # noqa: BLE001 - WS died before commit landed
+                logging.warning(
+                    "worker %s could not send commit for job %s (fence=%s): %s",
+                    self.worker_id,
+                    job_id,
+                    fence,
+                    e,
+                )
+
+    async def _cancel_jobs(self) -> None:
+        if not self._jobs:
+            return
+        tasks = list(self._jobs)
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def main() -> None:
