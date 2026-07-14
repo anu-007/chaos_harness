@@ -20,6 +20,10 @@ from db import DBPartitioned
 # Poll fallback so losing Redis only adds latency, never loses jobs.
 POLL_INTERVAL_S = 0.2
 WAKEUP_CHANNEL = "jobs:wakeup"
+# How long to wait before re-attempting the Redis wakeup subscription after it drops, so a
+# Redis outage degrades to poll-only latency and RESTORING Redis makes wakeups fast again
+# without a process restart.
+SUB_RETRY_S = 1.0
 
 
 class Dispatcher:
@@ -61,20 +65,34 @@ class Dispatcher:
         return time.monotonic() * 1000.0 < self.dispatch_paused_until_ms
 
     async def _subscribe(self) -> None:
-        """Best-effort Redis wakeup subscription; failures fall back to polling."""
-        try:
-            pubsub = self.app["redis"].pubsub()
-            await pubsub.subscribe(WAKEUP_CHANNEL)
-            async for _msg in pubsub.listen():
-                self.wake()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001 - Redis optional; poll still runs
-            logging.warning(
-                "coordinator %s: dispatch redis subscribe failed (polling only): %s",
-                self.coord_id,
-                e,
-            )
+        """Best-effort Redis wakeup subscription, retried forever on failure.
+
+        A wakeup only makes dispatch FASTER — the 200ms poll in _run() guarantees no job is
+        ever lost if Redis is down. But losing Redis must be latency-only AND recoverable:
+        if the subscription drops (Redis killed), we log once, wait SUB_RETRY_S, and try
+        again, so RESTORING Redis re-establishes fast wakeups without a process restart.
+        """
+        while True:
+            try:
+                pubsub = self.app["redis"].pubsub()
+                await pubsub.subscribe(WAKEUP_CHANNEL)
+                logging.info(
+                    "coordinator %s: dispatch wakeup subscription active", self.coord_id
+                )
+                async for _msg in pubsub.listen():
+                    self.wake()
+                # listen() returned without error (channel closed): fall through to retry.
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - Redis optional; poll still runs
+                logging.warning(
+                    "coordinator %s: dispatch redis subscribe dropped (polling only, "
+                    "retrying in %.1fs): %s",
+                    self.coord_id,
+                    SUB_RETRY_S,
+                    e,
+                )
+            await asyncio.sleep(SUB_RETRY_S)
 
     async def _run(self) -> None:
         while True:
