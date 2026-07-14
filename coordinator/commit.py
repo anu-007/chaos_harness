@@ -150,8 +150,27 @@ async def handle_commit(app, state, data: dict) -> None:
 
 
 async def _finish(app, state, conn, job_id, fence, accepted, replay: bool) -> None:
-    """Free the worker's capacity slot and reply ack / commit_rejected."""
+    """Free the worker's capacity slot and reply ack / commit_rejected.
+
+    drop_acks fault: if the counter is positive we suppress the next ACK (accepted commit
+    only) after the commit has ALREADY been persisted, decrementing the counter. The worker,
+    having received no ack, retries the same commit; that retry is an idempotent replay
+    (guarded by the one_accept index) so the result is still committed exactly once. A
+    commit_rejected is never dropped — the worker must learn its fence is stale and stop.
+    """
     state.inflight.discard(job_id)
+    if accepted and app.get("drop_acks_remaining", 0) > 0:
+        app["drop_acks_remaining"] -= 1
+        logging.info(
+            "coordinator %s: drop_acks suppressing ack for job %s fence=%s from %s "
+            "(persisted; worker will retry) — %d remaining",
+            app["coord_id"],
+            job_id,
+            fence,
+            state.worker_id,
+            app["drop_acks_remaining"],
+        )
+        return
     msg = {"type": "ack" if accepted else "commit_rejected", "job_id": str(job_id)}
     try:
         await state.ws.send_json(msg)

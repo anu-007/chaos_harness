@@ -25,6 +25,11 @@ _BACKOFF_MAX = 10.0
 # How often a running job pings its lease. Must be well under LEASE_TTL_MS (10s) so a lease
 # is renewed several times before it could expire.
 _HEARTBEAT_INTERVAL_S = 3.0
+# Commit-ack retry: after sending a commit, wait this long for ack/commit_rejected before
+# resending. The drop_acks fault suppresses acks; the worker must retry so the (already
+# persisted) commit is confirmed. Idempotent replay => still exactly one accepted commit.
+_COMMIT_ACK_TIMEOUT_S = 2.0
+_COMMIT_MAX_ATTEMPTS = 8
 
 
 class Worker:
@@ -37,6 +42,9 @@ class Worker:
         self._slots = asyncio.Semaphore(concurrency)
         # In-flight executor tasks, so a disconnect can cancel them cleanly.
         self._jobs: set[asyncio.Task] = set()
+        # Per-job commit-ack signals. A commit waits on its event; the read loop sets it on
+        # ack/commit_rejected. Lets a commit retry when drop_acks suppresses the ack.
+        self._acks: dict[str, asyncio.Event] = {}
 
     async def run(self) -> None:
         """Connect/register/read forever, reconnecting with exponential backoff."""
@@ -115,6 +123,14 @@ class Worker:
             task = asyncio.create_task(self._execute(ws, data))
             self._jobs.add(task)
             task.add_done_callback(self._jobs.discard)
+        elif mtype in ("ack", "commit_rejected"):
+            # Confirmation for a commit we sent — release its retry loop. Both outcomes are
+            # terminal for the worker: ack = accepted, commit_rejected = stale fence (stop).
+            job_id = data.get("job_id")
+            ev = self._acks.get(job_id)
+            if ev is not None:
+                ev.set()
+            logging.info("worker %s received: %s", self.worker_id, mtype)
         else:
             logging.info("worker %s received: %s", self.worker_id, mtype)
 
@@ -140,29 +156,52 @@ class Worker:
                 # Disconnected mid-job; drop it (no commit) and let the reaper re-lease.
                 raise
             result = {"ok": True, "worker": self.worker_id, "slept_ms": sleep_ms}
-            try:
-                await ws.send_json(
-                    {
-                        "type": "commit",
-                        "job_id": job_id,
-                        "fence": fence,
-                        "result": result,
-                    }
-                )
+            await self._commit_with_retry(ws, job_id, fence, result)
+
+    async def _commit_with_retry(self, ws, job_id, fence, result) -> None:
+        """Send commit{job_id,fence,result} and wait for ack/commit_rejected, resending on
+        timeout. The drop_acks fault deliberately suppresses acks AFTER persisting the
+        commit; the resend is an idempotent replay (the coordinator's one_accept index makes
+        it a re-ack, never a second result), so retrying keeps exactly-once while ensuring
+        the worker eventually confirms and frees its own bookkeeping."""
+        ev = asyncio.Event()
+        self._acks[job_id] = ev
+        msg = {"type": "commit", "job_id": job_id, "fence": fence, "result": result}
+        try:
+            for attempt in range(1, _COMMIT_MAX_ATTEMPTS + 1):
+                try:
+                    await ws.send_json(msg)
+                except Exception as e:  # noqa: BLE001 - WS died before commit landed
+                    logging.warning(
+                        "worker %s could not send commit for job %s (fence=%s): %s",
+                        self.worker_id,
+                        job_id,
+                        fence,
+                        e,
+                    )
+                    return
                 logging.info(
-                    "worker %s committed job %s (fence=%s)",
+                    "worker %s committed job %s (fence=%s, attempt=%d)",
                     self.worker_id,
                     job_id,
                     fence,
+                    attempt,
                 )
-            except Exception as e:  # noqa: BLE001 - WS died before commit landed
-                logging.warning(
-                    "worker %s could not send commit for job %s (fence=%s): %s",
-                    self.worker_id,
-                    job_id,
-                    fence,
-                    e,
-                )
+                try:
+                    await asyncio.wait_for(ev.wait(), timeout=_COMMIT_ACK_TIMEOUT_S)
+                    return  # ack or commit_rejected received
+                except asyncio.TimeoutError:
+                    # No confirmation (ack suppressed by drop_acks, or in flight) — resend.
+                    continue
+            logging.warning(
+                "worker %s gave up waiting for ack on job %s (fence=%s) after %d attempts",
+                self.worker_id,
+                job_id,
+                fence,
+                _COMMIT_MAX_ATTEMPTS,
+            )
+        finally:
+            self._acks.pop(job_id, None)
 
     async def _run_with_heartbeats(self, ws, job_id, fence, duration_s: float) -> None:
         """Sleep `duration_s` while emitting heartbeat{job_id,fence} so the coordinator

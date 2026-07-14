@@ -8,6 +8,7 @@ on startup, applies the schema idempotently, and serves a plain-text /stats endp
 Dispatch, leases, commits, audit, and the other endpoints are added in later steps.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ import time
 import redis.asyncio as aioredis
 from aiohttp import web
 
+from chaos import chaos_subscriber, handle_chaos
 from db import Database, DBPartitioned
 from dispatch import Dispatcher
 from reaper import Reaper
@@ -282,10 +284,18 @@ async def on_startup(app: web.Application) -> None:
     reaper.start()
     app["reaper"] = reaper
 
+    # Subscribe to peer chaos broadcasts so a fault injected at any coordinator degrades the
+    # whole system (worker WS is pinned to one coordinator; faults must reach all).
+    app["chaos_sub_task"] = asyncio.create_task(chaos_subscriber(app))
+
     logging.info("coordinator %s started", app["coord_id"])
 
 
 async def on_cleanup(app: web.Application) -> None:
+    chaos_sub = app.get("chaos_sub_task")
+    if chaos_sub is not None:
+        chaos_sub.cancel()
+        await asyncio.gather(chaos_sub, return_exceptions=True)
     reaper = app.get("reaper")
     if reaper is not None:
         await reaper.stop()
@@ -305,6 +315,8 @@ def make_app() -> web.Application:
     app["coord_id"] = os.environ.get("COORD_ID", "c?")
     app["lease_ttl_ms"] = int(os.environ.get("LEASE_TTL_MS", "10000"))
     app["start_monotonic"] = time.monotonic()
+    # drop_acks fault counter: acks to suppress before resuming normal replies (Step 17).
+    app["drop_acks_remaining"] = 0
     # Per-process registry of workers connected to THIS coordinator.
     app["workers"] = WorkerRegistry()
     app.on_startup.append(on_startup)
@@ -315,6 +327,7 @@ def make_app() -> web.Application:
             web.post("/jobs", handle_create_job),
             web.get("/jobs/{job_id}", handle_get_job),
             web.get("/audit", handle_audit),
+            web.post("/chaos", handle_chaos),
             web.get("/ws", handle_ws),
         ]
     )
