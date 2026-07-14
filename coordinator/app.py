@@ -21,7 +21,12 @@ from chaos import chaos_subscriber, handle_chaos
 from db import Database, DBPartitioned
 from dispatch import Dispatcher
 from reaper import Reaper
-from ws import WorkerRegistry, handle_ws
+from ws import (
+    WorkerRegistry,
+    concurrency_subscriber,
+    handle_set_concurrency,
+    handle_ws,
+)
 
 # Redis pub/sub channel the dispatch loop listens on for immediate wakeups.
 WAKEUP_CHANNEL = "jobs:wakeup"
@@ -294,6 +299,10 @@ async def on_startup(app: web.Application) -> None:
     # whole system (worker WS is pinned to one coordinator; faults must reach all).
     app["chaos_sub_task"] = asyncio.create_task(chaos_subscriber(app))
 
+    # Subscribe to peer concurrency broadcasts so POST /workers/{id}/concurrency at any
+    # coordinator reaches whichever coordinator holds that worker's pinned WS.
+    app["concurrency_sub_task"] = asyncio.create_task(concurrency_subscriber(app))
+
     logging.info("coordinator %s started", app["coord_id"])
 
 
@@ -302,6 +311,10 @@ async def on_cleanup(app: web.Application) -> None:
     if chaos_sub is not None:
         chaos_sub.cancel()
         await asyncio.gather(chaos_sub, return_exceptions=True)
+    conc_sub = app.get("concurrency_sub_task")
+    if conc_sub is not None:
+        conc_sub.cancel()
+        await asyncio.gather(conc_sub, return_exceptions=True)
     reaper = app.get("reaper")
     if reaper is not None:
         await reaper.stop()
@@ -337,6 +350,7 @@ def make_app() -> web.Application:
             web.get("/jobs/{job_id}", handle_get_job),
             web.get("/audit", handle_audit),
             web.post("/chaos", handle_chaos),
+            web.post("/workers/{id}/concurrency", handle_set_concurrency),
             web.get("/ws", handle_ws),
         ]
     )

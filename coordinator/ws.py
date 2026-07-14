@@ -10,12 +10,18 @@ later steps (lease renewal, fenced commit). On disconnect the worker is removed 
 registry; eager lease expiry for fast re-lease is wired once leases exist (Steps 11-15).
 """
 
+import json
 import logging
 
 from aiohttp import web, WSMsgType
 
 from commit import handle_commit, handle_heartbeat
 from db import DBPartitioned
+
+# Redis pub/sub channel for runtime per-worker concurrency changes. A worker's WS is pinned
+# to ONE coordinator, but POST /workers/{id}/concurrency can land on ANY coordinator via the
+# LB, so the request is broadcast; only the coordinator holding that worker acts on it.
+CONCURRENCY_CHANNEL = "workers:concurrency"
 
 
 class ConnState:
@@ -56,6 +62,109 @@ class WorkerRegistry:
 
     def __len__(self) -> int:
         return len(self._by_id)
+
+
+async def apply_set_concurrency(app: web.Application, worker_id: str, n: int) -> bool:
+    """If `worker_id` is connected to THIS coordinator, forward set_concurrency{n} over its
+    WS and update its registry limit so the dispatch loop respects the new ceiling at once.
+    Returns True if this coordinator holds the worker (and the message was sent).
+
+    The worker's WS is pinned to a single coordinator, so a runtime concurrency change made
+    at any coordinator is broadcast to all; only the one holding the worker acts.
+    """
+    registry: WorkerRegistry = app["workers"]
+    state = registry.get(worker_id)
+    if state is None:
+        return False
+    state.limit = n
+    try:
+        await state.ws.send_json({"type": "set_concurrency", "n": n})
+    except Exception as e:  # noqa: BLE001 - worker WS dying; it will re-register
+        logging.warning(
+            "coordinator %s: set_concurrency send to %s failed: %s",
+            app["coord_id"],
+            worker_id,
+            e,
+        )
+        return True
+    logging.info(
+        "coordinator %s: set worker %s concurrency to %d (runtime)",
+        app["coord_id"],
+        worker_id,
+        n,
+    )
+    return True
+
+
+async def handle_set_concurrency(request: web.Request) -> web.Response:
+    """POST /workers/{id}/concurrency {n} — reconfigure a worker's concurrency at runtime.
+
+    The worker's WS is pinned to a single coordinator, but this request can hit any
+    coordinator via the LB. So apply locally (a no-op unless THIS coordinator holds the
+    worker) and broadcast over Redis; the coordinator holding the worker forwards
+    set_concurrency{n} over its WS and updates the worker's registry limit, which the
+    dispatch loop respects immediately.
+    """
+    app = request.app
+    worker_id = request.match_info.get("id")
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - malformed JSON
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+
+    n = body.get("n")
+    if not isinstance(n, int) or n < 0:
+        return web.json_response(
+            {"error": "n is required and must be a non-negative integer"}, status=400
+        )
+
+    # Apply locally first so it works even if Redis is down (and returns True if this
+    # coordinator happens to hold the worker).
+    local = await apply_set_concurrency(app, worker_id, n)
+
+    # Broadcast so whichever coordinator holds the worker acts. The originator applies
+    # locally above and skips its own message in the subscriber.
+    try:
+        await app["redis"].publish(
+            CONCURRENCY_CHANNEL,
+            json.dumps({"worker_id": worker_id, "n": n, "from": app["coord_id"]}),
+        )
+    except Exception as e:  # noqa: BLE001 - Redis is best-effort
+        logging.warning(
+            "coordinator %s: concurrency broadcast failed (applied locally only): %s",
+            app["coord_id"],
+            e,
+        )
+
+    return web.json_response({"ok": True, "worker_id": worker_id, "n": n, "local": local})
+
+
+async def concurrency_subscriber(app: web.Application) -> None:
+    """Background task: apply concurrency changes broadcast by peer coordinators. The
+    originator already applied it locally and also receives its own publish; skip
+    self-originated messages to avoid a redundant re-send over the worker's WS."""
+    try:
+        pubsub = app["redis"].pubsub()
+        await pubsub.subscribe(CONCURRENCY_CHANNEL)
+        async for msg in pubsub.listen():
+            if msg.get("type") != "message":
+                continue
+            try:
+                payload = json.loads(msg["data"])
+            except Exception:  # noqa: BLE001 - ignore malformed peer message
+                continue
+            if payload.get("from") == app["coord_id"]:
+                continue
+            worker_id = payload.get("worker_id")
+            n = payload.get("n")
+            if isinstance(worker_id, str) and isinstance(n, int) and n >= 0:
+                await apply_set_concurrency(app, worker_id, n)
+    except Exception as e:  # noqa: BLE001 - Redis optional; local changes still work
+        logging.warning(
+            "coordinator %s: concurrency subscribe failed (local changes only): %s",
+            app["coord_id"],
+            e,
+        )
 
 
 async def handle_ws(request: web.Request) -> web.WebSocketResponse:

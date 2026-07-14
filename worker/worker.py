@@ -32,6 +32,49 @@ _COMMIT_ACK_TIMEOUT_S = 2.0
 _COMMIT_MAX_ATTEMPTS = 8
 
 
+class ResizableSemaphore:
+    """A counting semaphore whose limit can change at runtime, unlike asyncio.Semaphore.
+
+    Bounds concurrent job execution to `limit`. set_limit(n) raises the ceiling immediately
+    (waking as many waiters as new slots allow) or lowers it (new acquires block until
+    running jobs release below the new limit — never cancels in-flight work). Used so the
+    coordinator's set_concurrency{n} message can reconfigure a worker live without a restart.
+    """
+
+    def __init__(self, limit: int):
+        self._limit = max(0, int(limit))
+        self._in_use = 0
+        self._cond = asyncio.Condition()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    async def acquire(self) -> None:
+        async with self._cond:
+            while self._in_use >= self._limit:
+                await self._cond.wait()
+            self._in_use += 1
+
+    async def release(self) -> None:
+        async with self._cond:
+            self._in_use -= 1
+            self._cond.notify_all()
+
+    async def set_limit(self, n: int) -> None:
+        async with self._cond:
+            self._limit = max(0, int(n))
+            # Wake waiters; those that now fit proceed, the rest re-block on the new ceiling.
+            self._cond.notify_all()
+
+    async def __aenter__(self) -> "ResizableSemaphore":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.release()
+
+
 class Worker:
     def __init__(self, worker_id: str, concurrency: int, lb_url: str):
         self.worker_id = worker_id
@@ -39,7 +82,8 @@ class Worker:
         # ws://lb:8080 -> ws://lb:8080/ws
         self.ws_url = lb_url.rstrip("/") + "/ws"
         # Local slot limiter so this worker never runs more than `concurrency` jobs at once.
-        self._slots = asyncio.Semaphore(concurrency)
+        # Resizable so the coordinator can change the limit at runtime (set_concurrency).
+        self._slots = ResizableSemaphore(concurrency)
         # In-flight executor tasks, so a disconnect can cancel them cleanly.
         self._jobs: set[asyncio.Task] = set()
         # Per-job commit-ack signals. A commit waits on its event; the read loop sets it on
@@ -131,6 +175,21 @@ class Worker:
             if ev is not None:
                 ev.set()
             logging.info("worker %s received: %s", self.worker_id, mtype)
+        elif mtype == "set_concurrency":
+            # Runtime reconfiguration: resize the slot limiter live. Raising the limit lets
+            # queued jobs start at once; lowering it never cancels in-flight work — new
+            # acquires just block until running jobs drain below the new ceiling.
+            n = data.get("n")
+            if isinstance(n, int) and n >= 0:
+                self.concurrency = n
+                await self._slots.set_limit(n)
+                logging.info(
+                    "worker %s concurrency set to %d (runtime)", self.worker_id, n
+                )
+            else:
+                logging.warning(
+                    "worker %s ignoring bad set_concurrency: %r", self.worker_id, n
+                )
         else:
             logging.info("worker %s received: %s", self.worker_id, mtype)
 
