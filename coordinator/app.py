@@ -173,6 +173,89 @@ async def handle_get_job(request: web.Request) -> web.Response:
     )
 
 
+async def handle_audit(request: web.Request) -> web.Response:
+    """Return the full audit trail for one job: its transition log, commit-attempt log, and
+    lease history. This is the harness's window into correctness — it reads the three
+    append-only tables (never derived/in-memory state) so every claim it verifies (no-lost,
+    no-double-commit, fence monotonicity, no stale-commit) is backed by durable rows.
+
+    Each of the three queries is independent; a DBPartitioned on any of them fails the whole
+    request closed with 503 rather than returning a partial trail.
+    """
+    app = request.app
+    db: Database = app["db"]
+    job_id = request.query.get("job_id")
+    if not job_id:
+        return web.json_response({"error": "job_id query param required"}, status=400)
+
+    try:
+        transitions = await db.fetch(
+            """
+            SELECT from_state, to_state, at_ms, coordinator
+            FROM job_transitions
+            WHERE job_id = $1::uuid
+            ORDER BY at_ms, id
+            """,
+            job_id,
+        )
+        commits = await db.fetch(
+            """
+            SELECT accepted, fence, worker, at_ms
+            FROM commits
+            WHERE job_id = $1::uuid
+            ORDER BY at_ms, id
+            """,
+            job_id,
+        )
+        leases = await db.fetch(
+            """
+            SELECT fence, worker, issued_at_ms, expired_at_ms
+            FROM leases
+            WHERE job_id = $1::uuid
+            ORDER BY issued_at_ms, fence
+            """,
+            job_id,
+        )
+    except DBPartitioned:
+        return web.json_response(
+            {"error": "database partitioned; retry later"}, status=503
+        )
+    except Exception:  # noqa: BLE001 - e.g. malformed uuid
+        return web.json_response({"error": "invalid job_id"}, status=400)
+
+    return web.json_response(
+        {
+            "transitions": [
+                {
+                    "from": r["from_state"],
+                    "to": r["to_state"],
+                    "at_ms": r["at_ms"],
+                    "coordinator": r["coordinator"],
+                }
+                for r in transitions
+            ],
+            "commits": [
+                {
+                    "accepted": r["accepted"],
+                    "fence": r["fence"],
+                    "worker": r["worker"],
+                    "at_ms": r["at_ms"],
+                }
+                for r in commits
+            ],
+            "lease_history": [
+                {
+                    "fence": r["fence"],
+                    "worker": r["worker"],
+                    "issued_at_ms": r["issued_at_ms"],
+                    "expired_at_ms": r["expired_at_ms"],
+                }
+                for r in leases
+            ],
+        }
+    )
+
+
 async def on_startup(app: web.Application) -> None:
     # Postgres is required — failing to connect or apply the schema should crash the boot.
     db = Database.from_env()
@@ -231,6 +314,7 @@ def make_app() -> web.Application:
             web.get("/stats", handle_stats),
             web.post("/jobs", handle_create_job),
             web.get("/jobs/{job_id}", handle_get_job),
+            web.get("/audit", handle_audit),
             web.get("/ws", handle_ws),
         ]
     )
