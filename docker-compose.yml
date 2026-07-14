@@ -150,7 +150,19 @@ services:
       # writable drop for the report so the Makefile can copy it back to the repo root.
       - ./chaos_harness.py:/app/chaos_harness.py:ro
       - ./harness_out:/out
+      # `make test` runs pytest in THIS image and imports the real coordinator modules against
+      # the compose Postgres/Redis, so mount the source + tests + pytest config (read-only).
+      - ./coordinator:/app/coordinator:ro
+      - ./db:/app/db:ro
+      - ./tests:/app/tests:ro
+      - ./pytest.ini:/app/pytest.ini:ro
     environment:
       HARNESS_SEED: "${HARNESS_SEED:-1729}"
+      # For `make test`: reach the same source-of-truth Postgres and optimization Redis the
+      # coordinators use, and let pytest import `coordinator/` + the `tests/` package.
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/farlabs
+      REDIS_URL: redis://redis:6379/0
+      LEASE_TTL_MS: "10000"
+      PYTHONPATH: /app/coordinator:/app
     depends_on:
       - lb

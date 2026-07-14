@@ -1,1 +1,7 @@
 aiohttp
+# The pytest invariant suite (make test) runs in this same image against the compose
+# Postgres/Redis, importing the real coordinator modules, so it needs their deps too.
+asyncpg
+redis
+pytest
+pytest-asyncio

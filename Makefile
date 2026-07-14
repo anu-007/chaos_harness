@@ -44,6 +44,9 @@ chaos:
 	cp harness_out/chaos_report.txt chaos_report.txt 2>/dev/null && echo "report -> chaos_report.txt" || echo "no report produced"; \
 	exit $$rc
 
-# Run the pytest invariant suite (wired in Step 24).
+# Run the pytest invariant suite in the harness image against the compose Postgres/Redis.
+# Covers dedup (one id per key), strictly-increasing fences, exactly-once commit, expired-
+# lease rejection, reaper higher-fence requeue, and drop_acks single-accept. Needs the stack
+# up (make up) for Postgres; the ENTRYPOINT is python3, so `-m pytest` runs the suite.
 test:
 	docker compose --profile chaos run --rm harness -m pytest -q
