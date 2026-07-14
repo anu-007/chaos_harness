@@ -132,3 +132,25 @@ services:
     environment:
       <<: *worker-env
       WORKER_ID: w5
+
+  # Chaos-harness runner. Behind the `chaos` profile so a plain `docker compose up` never
+  # starts it; it is launched on demand via `docker compose run --rm harness ...` (see the
+  # Makefile `chaos` target). It joins the compose network (so it can DNS-resolve lb/c1..c3)
+  # and mounts the docker socket (so it can `docker kill`/`start` sibling containers by name).
+  harness:
+    build:
+      context: .
+      dockerfile: harness/Dockerfile
+    container_name: harness
+    profiles: ["chaos"]
+    volumes:
+      # Reach the host daemon to kill/start peer containers by name.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Bind-mount the harness so edits don't require an image rebuild, and expose /out as the
+      # writable drop for the report so the Makefile can copy it back to the repo root.
+      - ./chaos_harness.py:/app/chaos_harness.py:ro
+      - ./harness_out:/out
+    environment:
+      HARNESS_SEED: "${HARNESS_SEED:-1729}"
+    depends_on:
+      - lb
