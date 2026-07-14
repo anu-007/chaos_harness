@@ -17,6 +17,46 @@ CREATE OR REPLACE FUNCTION db_now_ms() RETURNS bigint
     SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint;
 $$;
 
+-- Single-row monotonic clock that couples fence allocation to issued_at_ms allocation.
+--
+-- Why: the harness's GLOBAL fence check sorts every lease by issued_at_ms and requires fence
+-- to strictly increase in that order. nextval('fence_seq') and clock_timestamp() are each
+-- monotonic on their own, but across CONCURRENT transactions on different coordinators their
+-- orderings can disagree (a txn can grab a lower fence yet stamp a later clock_timestamp),
+-- producing fence-vs-time inversions. issue_fence() removes that by allocating BOTH under one
+-- atomic UPDATE of this one row: the row lock fully serializes concurrent issuers, so whoever
+-- commits first gets both the lower fence AND the lower issued_at_ms. GREATEST(db_now_ms(),
+-- last+1) keeps issued_at_ms a real wall-clock ms (only nudged forward by >=1ms under
+-- contention) so /stats age math stays correct.
+CREATE TABLE IF NOT EXISTS fence_clock (
+    id           boolean PRIMARY KEY DEFAULT true CHECK (id),  -- exactly one row
+    last_issued  bigint  NOT NULL DEFAULT 0
+);
+INSERT INTO fence_clock (id, last_issued) VALUES (true, 0)
+    ON CONFLICT (id) DO NOTHING;
+
+-- Atomically allocate the next (fence, issued_at_ms) pair. Serialized by the row lock on the
+-- single fence_clock row, so the returned pairs are jointly monotonic: fence_a < fence_b
+-- implies issued_at_ms_a < issued_at_ms_b, cluster-wide.
+CREATE OR REPLACE FUNCTION issue_fence()
+    RETURNS TABLE (fence bigint, issued_at_ms bigint)
+    LANGUAGE plpgsql VOLATILE AS $$
+DECLARE
+    ms bigint;
+BEGIN
+    -- The UPDATE takes a FOR NO KEY UPDATE row lock; concurrent callers block here until the
+    -- holder commits, guaranteeing lock-acquisition order == fence order == issued_at order.
+    UPDATE fence_clock
+       SET last_issued = GREATEST(db_now_ms(), last_issued + 1)
+     WHERE id = true
+    RETURNING last_issued INTO ms;
+
+    fence := nextval('fence_seq');
+    issued_at_ms := ms;
+    RETURN NEXT;
+END;
+$$;
+
 -- Jobs. idempotency_key UNIQUE enforces dedup even for concurrent same-key submissions
 -- landing on different coordinators in the same millisecond.
 -- state in: pending | leased | succeeded | failed | cancelled

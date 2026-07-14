@@ -192,17 +192,21 @@ class Dispatcher:
     async def _default_issue(self, conn, job_id, state) -> int:
         """Issue the fenced lease for a just-claimed job, inside the claim transaction.
 
-        Inserts the lease row (fence from nextval('fence_seq'), issued/expiry stamped from
-        the DB clock via db_now_ms) and records the pending->leased transition. Returns the
-        allocated fence token so the caller can push it to the worker after commit.
+        fence + issued_at_ms come as ONE jointly-monotonic pair from issue_fence() (serialized
+        by the fence_clock row lock) so a lower fence always carries a strictly lower
+        issued_at_ms cluster-wide — the harness's global fence-vs-time check can't be violated.
+        expires_at_ms is the real deadline issued_at_ms + TTL, so the reaper's db_now_ms()
+        comparison still bounds correctness. Also records the pending->leased transition.
+        Returns the allocated fence token so the caller can push it to the worker after commit.
         """
         from app import record_transition
 
         ttl_ms = self.app["lease_ttl_ms"]
         fence = await conn.fetchval(
             """
+            WITH f AS (SELECT fence, issued_at_ms FROM issue_fence())
             INSERT INTO leases (job_id, fence, worker, issued_at_ms, expires_at_ms)
-            VALUES ($1, nextval('fence_seq'), $2, db_now_ms(), db_now_ms() + $3)
+            SELECT $1, f.fence, $2, f.issued_at_ms, f.issued_at_ms + $3 FROM f
             RETURNING fence
             """,
             job_id,

@@ -16,7 +16,12 @@ x-worker: &worker
     dockerfile: worker/Dockerfile
   environment: &worker-env
     LB_WS_URL: ws://lb:8080
-    WORKER_CONCURRENCY: "2"
+    # 5 workers x 16 = 80 concurrent slots. The harness submits at 50 jobs/s with a mixed
+    # profile (avg ~1.16s/job: 95% short 100-500ms + 5% long 5-30s), so steady-state drain
+    # needs ~58 slots (50 * 1.16). 80 gives headroom for the long-job tail and for slots tied
+    # up during fault windows (partition_db / pause_dispatch), so the backlog never grows
+    # unboundedly and jobs aren't left un-dispatched at drain -> no "lost" violations.
+    WORKER_CONCURRENCY: "16"
   depends_on:
     - lb
 

@@ -7,9 +7,26 @@
 FROM python:3.11-slim
 
 # docker CLI only (no daemon) — used to kill/start peer containers via the mounted socket.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends docker.io \
-    && rm -rf /var/lib/apt/lists/*
+# NOTE: the Debian `docker.io` apt package is unusable on python:3.11-slim — the slim image
+# ships /etc/dpkg/dpkg.cfg.d/docker path-excludes that strip the /usr/bin/docker binary, so
+# `docker` ends up "not found" even though dpkg reports it installed. Instead pull the official
+# static docker CLI binary (client only) for the target arch straight from download.docker.com.
+ARG DOCKER_CLI_VERSION=27.3.1
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+        amd64) dl_arch="x86_64" ;; \
+        arm64) dl_arch="aarch64" ;; \
+        *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://download.docker.com/linux/static/stable/${dl_arch}/docker-${DOCKER_CLI_VERSION}.tgz" -o /tmp/docker.tgz; \
+    tar -xzf /tmp/docker.tgz -C /tmp; \
+    install -m 0755 /tmp/docker/docker /usr/local/bin/docker; \
+    rm -rf /tmp/docker /tmp/docker.tgz; \
+    apt-get purge -y curl; apt-get autoremove -y; rm -rf /var/lib/apt/lists/*; \
+    docker --version
 
 WORKDIR /app
 
