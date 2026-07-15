@@ -546,8 +546,24 @@ def make_app() -> web.Application:
     return app
 
 
+def _load_dotenv() -> None:
+    """For non-Docker (local) runs: populate os.environ from the repo-root .env.
+
+    A no-op under Docker (compose injects the same vars via env_file, and load_dotenv does
+    NOT override already-set vars, so container values always win) and when python-dotenv is
+    not installed. find_dotenv walks up from the CWD so it works regardless of where the
+    process is launched from.
+    """
+    try:
+        from dotenv import find_dotenv, load_dotenv
+    except ImportError:
+        return
+    load_dotenv(find_dotenv(usecwd=True))
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    _load_dotenv()
     web.run_app(make_app(), host="0.0.0.0", port=8080)
 
 

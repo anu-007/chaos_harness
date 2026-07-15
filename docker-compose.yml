@@ -4,24 +4,22 @@
 # are added in later steps. Service name == container_name for every coordinator so
 # the harness can both DNS-resolve (c1/c2/c3, lb) and docker kill/start by name.
 
-x-coordinator-env: &coordinator-env
-  DATABASE_URL: postgres://postgres:postgres@postgres:5432/farlabs
-  REDIS_URL: redis://redis:6379/0
-  LEASE_TTL_MS: "10000"
-
-# Shared worker service definition. Each worker overrides container_name + WORKER_ID.
+# Shared config (DATABASE_URL, REDIS_URL, LEASE_TTL_MS, LB_WS_URL, WORKER_CONCURRENCY) lives
+# in the gitignored `.env` (copy from the committed `.env.example`) and is loaded per service
+# via `env_file`. Only per-service identity (COORD_ID, WORKER_ID) is set inline below, since
+# each container needs a distinct value that a single shared file can't provide.
+#
+# WORKER_CONCURRENCY (in .env): 5 workers x 16 = 80 concurrent slots. The harness submits at
+# 50 jobs/s with a mixed profile (avg ~1.16s/job: 95% short 100-500ms + 5% long 5-30s), so
+# steady-state drain needs ~58 slots (50 * 1.16). 80 gives headroom for the long-job tail and
+# for slots tied up during fault windows (partition_db / pause_dispatch), so the backlog never
+# grows unboundedly and jobs aren't left un-dispatched at drain -> no "lost" violations.
 x-worker: &worker
   build:
     context: .
     dockerfile: worker/Dockerfile
-  environment: &worker-env
-    LB_WS_URL: ws://lb:8080
-    # 5 workers x 16 = 80 concurrent slots. The harness submits at 50 jobs/s with a mixed
-    # profile (avg ~1.16s/job: 95% short 100-500ms + 5% long 5-30s), so steady-state drain
-    # needs ~58 slots (50 * 1.16). 80 gives headroom for the long-job tail and for slots tied
-    # up during fault windows (partition_db / pause_dispatch), so the backlog never grows
-    # unboundedly and jobs aren't left un-dispatched at drain -> no "lost" violations.
-    WORKER_CONCURRENCY: "16"
+  env_file:
+    - .env
   depends_on:
     - lb
 
@@ -54,8 +52,9 @@ services:
       context: .
       dockerfile: coordinator/Dockerfile
     container_name: c1
+    env_file:
+      - .env
     environment:
-      <<: *coordinator-env
       COORD_ID: c1
     depends_on:
       postgres:
@@ -68,8 +67,9 @@ services:
       context: .
       dockerfile: coordinator/Dockerfile
     container_name: c2
+    env_file:
+      - .env
     environment:
-      <<: *coordinator-env
       COORD_ID: c2
     depends_on:
       postgres:
@@ -82,8 +82,9 @@ services:
       context: .
       dockerfile: coordinator/Dockerfile
     container_name: c3
+    env_file:
+      - .env
     environment:
-      <<: *coordinator-env
       COORD_ID: c3
     depends_on:
       postgres:
@@ -107,35 +108,30 @@ services:
     <<: *worker
     container_name: w1
     environment:
-      <<: *worker-env
       WORKER_ID: w1
 
   w2:
     <<: *worker
     container_name: w2
     environment:
-      <<: *worker-env
       WORKER_ID: w2
 
   w3:
     <<: *worker
     container_name: w3
     environment:
-      <<: *worker-env
       WORKER_ID: w3
 
   w4:
     <<: *worker
     container_name: w4
     environment:
-      <<: *worker-env
       WORKER_ID: w4
 
   w5:
     <<: *worker
     container_name: w5
     environment:
-      <<: *worker-env
       WORKER_ID: w5
 
   # Chaos-harness runner. Behind the `chaos` profile so a plain `docker compose up` never
@@ -161,13 +157,14 @@ services:
       - ./db:/app/db:ro
       - ./tests:/app/tests:ro
       - ./pytest.ini:/app/pytest.ini:ro
+    # Shared DATABASE_URL / REDIS_URL / LEASE_TTL_MS come from .env (for `make test`, which
+    # imports the real coordinator modules against the compose Postgres/Redis). Only the
+    # harness-specific vars are inline: HARNESS_SEED (interpolated from the host env) and
+    # PYTHONPATH (so pytest can import `coordinator/` + the `tests/` package).
+    env_file:
+      - .env
     environment:
       HARNESS_SEED: "${HARNESS_SEED:-1729}"
-      # For `make test`: reach the same source-of-truth Postgres and optimization Redis the
-      # coordinators use, and let pytest import `coordinator/` + the `tests/` package.
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/farlabs
-      REDIS_URL: redis://redis:6379/0
-      LEASE_TTL_MS: "10000"
       PYTHONPATH: /app/coordinator:/app
     depends_on:
       - lb

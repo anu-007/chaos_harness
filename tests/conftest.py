@@ -19,6 +19,16 @@ import pytest_asyncio
 
 from db import Database
 
+# For non-Docker (local) `pytest` runs, populate os.environ from the repo-root .env before
+# reading DATABASE_URL. No-op under the harness image (compose injects it via env_file, and
+# load_dotenv does not override an already-set var) and when python-dotenv is absent.
+try:
+    from dotenv import find_dotenv, load_dotenv
+
+    load_dotenv(find_dotenv(usecwd=True))
+except ImportError:
+    pass
+
 DSN = os.environ["DATABASE_URL"]
 
 

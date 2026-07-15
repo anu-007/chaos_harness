@@ -9,3 +9,5 @@ venv/
 # Harness artifacts
 chaos_events.jsonl
 harness_out/
+scripts/
+session.md
