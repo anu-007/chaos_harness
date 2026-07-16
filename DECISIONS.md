@@ -20,8 +20,9 @@ stated as **Chose / Over / Because / Cost** so the trade-off is legible in both 
   `issued_at_ms`. `GREATEST(db_now_ms(), last+1)` keeps the timestamp real wall-clock (nudged
   forward ≥1ms only under contention). A Redis/app counter could not give this joint atomicity.
 - **Cost:** The database sits on the fence-issue hot path, and every lease serializes on one
-  `fence_clock` row. Measured fine at 50 jobs/s (submit p99 ≈ 5ms), but it is a deliberate
-  throughput ceiling in exchange for a correctness guarantee that is impossible to violate.
+  `fence_clock` row. Measured fine at 50 jobs/s (submit p50 ≈ 2.2ms, p95 ≈ 3.5ms, p99 ≈ 5.4ms),
+  but it is a deliberate throughput ceiling in exchange for a correctness guarantee that is
+  impossible to violate.
 
 ---
 
@@ -94,10 +95,13 @@ stated as **Chose / Over / Because / Cost** so the trade-off is legible in both 
 
 ### Chaos result & honesty note
 
-Full `make chaos` (600s, rate 50) passes with **0 invariant violations** on the default seed
-`1729` and on a fresh seed `42` (17 worker kills, 6 coordinator kills, all fault types injected;
-`chaos_report.txt` committed). Two operational — not correctness — fixes were needed to reach a
-clean verdict: sizing worker concurrency so the fixed 50 jobs/s submit rate can actually drain
+Full `make chaos` (651.6s wall, rate 50) passes with **0 invariant violations** on the default
+seed `1729` — 16 worker kills, 6 coordinator kills, and all four fault types injected
+(`clock_skew` 10, `drop_acks` 7, `partition_db` 6, `pause_dispatch` 7). Of 26,961 successful
+submissions (plus 1,444 duplicates correctly deduped), all 25,517 tracked jobs reached an
+accepted commit with 0 audit-unreachable (`chaos_report.txt` committed). Two operational — not
+correctness — fixes were needed to reach a clean verdict: sizing worker concurrency so the fixed
+50 jobs/s submit rate can actually drain
 (otherwise un-dispatched jobs read as `lost`), and enabling nginx `proxy_next_upstream ...
 non_idempotent` so a POST landing on a killed/partitioned coordinator transparently retries a
 healthy peer — safe precisely because job creation is idempotent (`ON CONFLICT (idempotency_key)

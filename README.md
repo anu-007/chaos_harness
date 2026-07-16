@@ -2,6 +2,58 @@
 
 This is the harness referenced in Section 4 of the take-home. You do not modify it. You run it against your stack and commit its output.
 
+## Demo video
+[Video](https://youtu.be/R1KQL_uOC2c?si=ECeJhN5npSkP-dcj)
+
+
+## Running the stack
+
+The whole FarLabs dispatcher (Postgres, Redis, three coordinators `c1/c2/c3`, the nginx LB,
+and five workers `w1..w5`) runs via `docker compose`. Convenience targets live in the `Makefile`.
+
+### Prerequisites
+
+- Docker with the `docker compose` plugin
+- Python 3.11+ with `aiohttp` (only if you run `chaos_harness.py` directly instead of `make chaos`)
+
+### Steps
+
+1. Create your `.env` from the template (gitignored; loaded by every service via `env_file`):
+   ```
+   cp .env.example .env
+   ```
+2. Build and start the stack in the background:
+   ```
+   make up
+   ```
+3. Check container status (all should be healthy/up):
+   ```
+   make ps
+   ```
+   The LB is published on `http://localhost:8080` — e.g. `curl http://localhost:8080/stats`.
+4. Follow logs if needed:
+   ```
+   make logs
+   ```
+5. Run the pytest invariant suite against the running stack:
+   ```
+   make test
+   ```
+6. Run the chaos harness (duration/rate overridable; writes `chaos_report.txt` at the repo root):
+   ```
+   make chaos                      # defaults: DURATION=600, RATE=50, seed 1729
+   make chaos DURATION=60          # shorter smoke run
+   make chaos HARNESS_SEED=42      # fresh, non-seed-tuned run
+   ```
+7. Tear everything down and drop volumes (fresh Postgres/Redis next time):
+   ```
+   make down
+   ```
+
+`make chaos` runs the harness container on the compose network so it can reach the LB (`lb:8080`)
+and `docker kill`/`start` the coordinators and workers by name. To invoke the harness manually
+against a stack, see **Invocation** below.
+
 ## Requirements
 
 - Python 3.11+
